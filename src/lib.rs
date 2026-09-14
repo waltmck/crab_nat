@@ -150,16 +150,43 @@ pub enum PortMappingType {
 /// Specifies the address of the gateway, either IPv4 or IPv6.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GatewayAddress {
-    /// IPv4 address of the gateway.
-    IpV4(std::net::Ipv4Addr),
+    /// IPv4 address of the gateway, with an optional index of the network interface it is
+    /// reached through, see `interface_index`.
+    IpV4(std::net::Ipv4Addr, Option<u32>),
 
     /// IPv6 address of the gateway, with an optional scope (zone) id for link-local addresses.
+    /// The scope id doubles as the index of the network interface the gateway is reached
+    /// through, see `interface_index`.
     IpV6(std::net::Ipv6Addr, Option<u32>),
+}
+impl GatewayAddress {
+    /// The index of the network interface the gateway is reached through, if one was given.
+    /// Sockets toward a gateway with a known interface are bound to it, so that hosts
+    /// connected to several networks exchange with each gateway through its own network,
+    /// regardless of the routing table — which cannot distinguish the gateways when the
+    /// networks use identical (e.g. private) address ranges.
+    /// # Notes
+    /// An index names one interface instance: unlike interface names, indices are not
+    /// promptly reused, so a bound socket whose interface disappears fails with an error
+    /// instead of silently moving to another network. Re-attempt with a fresh index after
+    /// such an error.
+    ///
+    /// Interface binding exists on Linux, Android, Apple, and Solaris-family platforms;
+    /// Linux kernels older than 5.7 require the `CAP_NET_RAW` capability to bind, and
+    /// socket creation fails without it. On other platforms sockets are not bound, but the
+    /// index still selects the interface the announcement listener joins multicast groups
+    /// on where joining by index is supported, and the IPv6 link-local scope everywhere.
+    #[must_use]
+    pub fn interface_index(&self) -> Option<u32> {
+        match self {
+            GatewayAddress::IpV4(_, index) | GatewayAddress::IpV6(_, index) => *index,
+        }
+    }
 }
 impl From<GatewayAddress> for IpAddr {
     fn from(gateway: GatewayAddress) -> Self {
         match gateway {
-            GatewayAddress::IpV4(v4) => IpAddr::V4(v4),
+            GatewayAddress::IpV4(v4, _) => IpAddr::V4(v4),
             GatewayAddress::IpV6(v6, _) => IpAddr::V6(v6),
         }
     }
@@ -167,14 +194,14 @@ impl From<GatewayAddress> for IpAddr {
 impl From<IpAddr> for GatewayAddress {
     fn from(ip: IpAddr) -> Self {
         match ip {
-            IpAddr::V4(v4) => GatewayAddress::IpV4(v4),
+            IpAddr::V4(v4) => GatewayAddress::IpV4(v4, None),
             IpAddr::V6(v6) => GatewayAddress::IpV6(v6, None),
         }
     }
 }
 impl From<std::net::Ipv4Addr> for GatewayAddress {
     fn from(ip: std::net::Ipv4Addr) -> Self {
-        GatewayAddress::IpV4(ip)
+        GatewayAddress::IpV4(ip, None)
     }
 }
 impl From<std::net::Ipv6Addr> for GatewayAddress {
@@ -870,10 +897,10 @@ impl AddressChangeListener {
         let timeout = upnp::tcp_timeout(timeout_config);
 
         // Subscribe to the state change events of the gateway's WAN connection service.
-        let callback = helpers::bind_tcp_listener(std::net::SocketAddr::new(
-            client,
-            callback_port.map_or(0, NonZeroU16::get),
-        ))
+        let callback = helpers::bind_tcp_listener(
+            std::net::SocketAddr::new(client, callback_port.map_or(0, NonZeroU16::get)),
+            event_url.interface,
+        )
         .map_err(ListenerFailure::Socket)?;
         let callback_address = callback.local_addr().map_err(ListenerFailure::Socket)?;
         let subscription = upnp::subscribe(event_url, callback_address, timeout).await?;
@@ -1139,7 +1166,7 @@ mod helpers {
         use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 
         match gateway {
-            GatewayAddress::IpV4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, port)),
+            GatewayAddress::IpV4(v4, _) => SocketAddr::V4(SocketAddrV4::new(v4, port)),
             GatewayAddress::IpV6(v6, scope_id) => {
                 SocketAddr::V6(SocketAddrV6::new(v6, port, 0, scope_id.unwrap_or(0)))
             }
@@ -1162,6 +1189,48 @@ mod helpers {
         Ok(())
     }
 
+    /// Bind a socket to a network interface by its index, when one is given.
+    /// See `GatewayAddress::interface_index`; binding exists on Linux, Android, Apple, and
+    /// Solaris-family platforms, and the index is ignored elsewhere.
+    fn bind_interface(
+        socket: &socket2::Socket,
+        ipv6: bool,
+        interface: Option<u32>,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(any(
+            target_os = "android",
+            target_os = "linux",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+            target_os = "illumos",
+            target_os = "solaris",
+        ))]
+        if let Some(index) = interface.and_then(std::num::NonZeroU32::new) {
+            return if ipv6 {
+                socket.bind_device_by_index_v6(Some(index))
+            } else {
+                socket.bind_device_by_index_v4(Some(index))
+            };
+        }
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "linux",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+            target_os = "illumos",
+            target_os = "solaris",
+        )))]
+        let _ = (socket, ipv6, interface);
+
+        Ok(())
+    }
+
     /// Create a new UDP socket with an IP protocol matching that of the gateway address.
     /// # Errors
     /// Will return an error if we fail to bind to a local UDP socket or to apply a firewall mark.
@@ -1170,7 +1239,7 @@ mod helpers {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
         let (domain, bind_address) = match &gateway {
-            GatewayAddress::IpV4(_) => (
+            GatewayAddress::IpV4(_, _) => (
                 Domain::IPV4,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             ),
@@ -1182,6 +1251,7 @@ mod helpers {
 
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         apply_fwmark(&socket)?;
+        bind_interface(&socket, domain == Domain::IPV6, gateway.interface_index())?;
         socket.set_nonblocking(true)?;
         socket.bind(&bind_address.into())?;
 
@@ -1201,11 +1271,13 @@ mod helpers {
         Ok(socket)
     }
 
-    /// Open a TCP connection to the given address, applying the configured firewall mark.
+    /// Open a TCP connection to the given address, applying the configured firewall mark
+    /// and binding to the given interface, when one is known toward the address.
     /// # Errors
     /// Will return an error if we fail to create the socket or connect to the address.
     pub async fn connect_tcp(
         address: std::net::SocketAddr,
+        interface: Option<u32>,
     ) -> Result<tokio::net::TcpStream, std::io::Error> {
         use socket2::{Domain, Protocol, Socket, Type};
 
@@ -1216,6 +1288,7 @@ mod helpers {
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         apply_fwmark(&socket)?;
+        bind_interface(&socket, domain == Domain::IPV6, interface)?;
         socket.set_nonblocking(true)?;
 
         tokio::net::TcpSocket::from_std_stream(socket.into())
@@ -1223,12 +1296,14 @@ mod helpers {
             .await
     }
 
-    /// Create a TCP listener bound to the given address, applying the configured firewall mark.
+    /// Create a TCP listener bound to the given address, applying the configured firewall
+    /// mark and binding to the given interface, when one is known toward the gateway.
     /// Connections accepted from the listener inherit the mark for their responses.
     /// # Errors
     /// Will return an error if we fail to bind or listen on the address.
     pub fn bind_tcp_listener(
         address: std::net::SocketAddr,
+        interface: Option<u32>,
     ) -> Result<tokio::net::TcpListener, std::io::Error> {
         use socket2::{Domain, Protocol, Socket, Type};
 
@@ -1239,6 +1314,7 @@ mod helpers {
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         apply_fwmark(&socket)?;
+        bind_interface(&socket, domain == Domain::IPV6, interface)?;
         socket.set_nonblocking(true)?;
         socket.bind(&address.into())?;
         socket.listen(1024)?;
@@ -1257,7 +1333,7 @@ mod helpers {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
         let (domain, bind_address) = match &gateway {
-            GatewayAddress::IpV4(_) => (
+            GatewayAddress::IpV4(_, _) => (
                 Domain::IPV4,
                 // Binding the group address also filters unrelated unicast traffic,
                 // but is not supported on all platforms.
@@ -1280,6 +1356,7 @@ mod helpers {
 
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         apply_fwmark(&socket)?;
+        bind_interface(&socket, domain == Domain::IPV6, gateway.interface_index())?;
         socket.set_reuse_address(true)?;
         #[cfg(all(
             unix,
@@ -1293,15 +1370,13 @@ mod helpers {
         socket.set_reuse_port(true)?;
         socket.set_nonblocking(true)?;
         socket.bind(&bind_address.into())?;
-        let socket = UdpSocket::from_std(socket.into())?;
 
         // Announcements are addressed to the all-hosts and all-nodes multicast groups, which
-        // hosts are implicitly members of; join explicitly where supported and continue otherwise.
+        // hosts are implicitly members of; join explicitly where supported and continue
+        // otherwise. With a known interface toward the gateway the group is joined there,
+        // otherwise the kernel joins on an interface of its choosing.
         match gateway {
-            GatewayAddress::IpV4(_) => {
-                let _ =
-                    socket.join_multicast_v4(Ipv4Addr::new(224, 0, 0, 1), Ipv4Addr::UNSPECIFIED);
-            }
+            GatewayAddress::IpV4(_, index) => join_all_hosts_v4(&socket, index),
             GatewayAddress::IpV6(_, scope_id) => {
                 let _ = socket.join_multicast_v6(
                     &Ipv6Addr::new(0xFF02, 0, 0, 0, 0, 0, 0, 1),
@@ -1310,7 +1385,56 @@ mod helpers {
             }
         }
 
-        Ok(socket)
+        UdpSocket::from_std(socket.into())
+    }
+
+    /// Join the IPv4 all-hosts multicast group, on the given interface when the platform
+    /// supports joining by index; the kernel picks the interface otherwise.
+    fn join_all_hosts_v4(socket: &socket2::Socket, interface: Option<u32>) {
+        use std::net::Ipv4Addr;
+        const ALL_HOSTS: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 1);
+
+        #[cfg(not(any(
+            target_os = "aix",
+            target_os = "haiku",
+            target_os = "illumos",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "nto",
+            target_os = "espidf",
+            target_os = "vita",
+            target_os = "cygwin",
+            target_os = "wasi",
+            target_os = "horizon"
+        )))]
+        {
+            let interface = match interface {
+                Some(index) => socket2::InterfaceIndexOrAddress::Index(index),
+                None => socket2::InterfaceIndexOrAddress::Address(Ipv4Addr::UNSPECIFIED),
+            };
+            let _ = socket.join_multicast_v4_n(&ALL_HOSTS, &interface);
+        }
+        #[cfg(any(
+            target_os = "aix",
+            target_os = "haiku",
+            target_os = "illumos",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "nto",
+            target_os = "espidf",
+            target_os = "vita",
+            target_os = "cygwin",
+            target_os = "wasi",
+            target_os = "horizon"
+        ))]
+        {
+            let _ = interface;
+            let _ = socket.join_multicast_v4(&ALL_HOSTS, &Ipv4Addr::UNSPECIFIED);
+        }
     }
 
     pub enum RequestSendError {

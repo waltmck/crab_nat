@@ -351,6 +351,10 @@ pub struct EventUrl {
 
     /// The absolute path of the URL.
     pub path: String,
+
+    /// The index of the network interface the gateway was discovered through, if one was
+    /// given; connections to the URL are bound to it, see `GatewayAddress::interface_index`.
+    pub interface: Option<u32>,
 }
 
 /// The endpoint used to manage port mappings on the gateway, discovered through an SSDP
@@ -369,6 +373,10 @@ pub struct ControlEndpoint {
     /// The URL used to subscribe to the service's state change events.
     /// `None` if the service does not offer eventing.
     pub event_url: Option<EventUrl>,
+
+    /// The index of the network interface the gateway was discovered through, if one was
+    /// given; connections to the endpoint are bound to it, see `GatewayAddress::interface_index`.
+    pub interface: Option<u32>,
 }
 
 /// How long to keep collecting further search responses after the first from the gateway,
@@ -416,7 +424,7 @@ pub async fn discover_gateway(
     // Reference implementations use this group in the HOST header of every search request,
     // including unicast ones, so deployed devices are only known to accept this form.
     let (multicast_destination, multicast_host) = match gateway {
-        GatewayAddress::IpV4(_) => (
+        GatewayAddress::IpV4(_, _) => (
             SocketAddr::from((std::net::Ipv4Addr::new(239, 255, 255, 250), DISCOVERY_PORT)),
             format!("239.255.255.250:{DISCOVERY_PORT}"),
         ),
@@ -615,7 +623,13 @@ async fn control_endpoint_from_location(
             "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
             host = host_header(&address),
         );
-        let response = http_request(address, request.as_bytes(), timeout).await?;
+        let response = http_request(
+            address,
+            gateway.interface_index(),
+            request.as_bytes(),
+            timeout,
+        )
+        .await?;
         match response.status {
             200 => break (response.body, authority, path),
 
@@ -655,6 +669,7 @@ async fn control_endpoint_from_location(
             Some(EventUrl {
                 address: repoint_at_gateway(gateway, &event_authority).ok()?,
                 path: event_path,
+                interface: gateway.interface_index(),
             })
         });
 
@@ -663,6 +678,7 @@ async fn control_endpoint_from_location(
             control_path,
             service: service.service,
             event_url,
+            interface: gateway.interface_index(),
         });
     }
 
@@ -1223,17 +1239,19 @@ fn host_header(address: &SocketAddr) -> String {
 }
 
 /// Perform a single HTTP request against the given address and return the parsed response.
+/// The connection is bound to the given interface, when one is known toward the address.
 /// # Errors
 /// Will return a `Socket(..)` error if the TCP connection fails, a `Timeout` error if the exchange
 /// does not complete within the timeout, or an `InvalidResponse(..)` error for unparsable responses.
 async fn http_request(
     address: SocketAddr,
+    interface: Option<u32>,
     request: &[u8],
     timeout: Duration,
 ) -> Result<HttpResponse, Failure> {
     let exchange = async {
         // Open a new TCP connection to the gateway and send the request.
-        let mut stream = helpers::connect_tcp(address)
+        let mut stream = helpers::connect_tcp(address, interface)
             .await
             .map_err(Failure::Socket)?;
         stream.write_all(request).await.map_err(Failure::Socket)?;
@@ -1432,7 +1450,13 @@ async fn soap_request(
         length = body.len(),
     );
 
-    let response = http_request(endpoint.address, request.as_bytes(), timeout).await?;
+    let response = http_request(
+        endpoint.address,
+        endpoint.interface,
+        request.as_bytes(),
+        timeout,
+    )
+    .await?;
 
     // Some gateways return error responses with a success or unrelated status code,
     // so an error code in the body takes precedence over the status line.
@@ -1518,7 +1542,13 @@ pub(crate) async fn subscribe(
         host = host_header(&event_url.address),
         callback = host_header(&callback),
     );
-    let response = http_request(event_url.address, request.as_bytes(), timeout).await?;
+    let response = http_request(
+        event_url.address,
+        event_url.interface,
+        request.as_bytes(),
+        timeout,
+    )
+    .await?;
     if response.status != 200 {
         return Err(Failure::HttpStatus(response.status));
     }
@@ -1548,7 +1578,13 @@ pub(crate) async fn renew_subscription(
         host = host_header(&subscription.url.address),
         sid = subscription.sid,
     );
-    let response = http_request(subscription.url.address, request.as_bytes(), timeout).await?;
+    let response = http_request(
+        subscription.url.address,
+        subscription.url.interface,
+        request.as_bytes(),
+        timeout,
+    )
+    .await?;
     if response.status != 200 {
         return Err(Failure::HttpStatus(response.status));
     }
@@ -1570,7 +1606,13 @@ pub(crate) async fn unsubscribe(
         host = host_header(&subscription.url.address),
         sid = subscription.sid,
     );
-    let response = http_request(subscription.url.address, request.as_bytes(), timeout).await?;
+    let response = http_request(
+        subscription.url.address,
+        subscription.url.interface,
+        request.as_bytes(),
+        timeout,
+    )
+    .await?;
     if response.status != 200 {
         return Err(Failure::HttpStatus(response.status));
     }
