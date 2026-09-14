@@ -2,7 +2,7 @@ use std::{net::IpAddr, num::NonZeroU16};
 
 use crab_nat::PortMappingOptions;
 
-/// A simple command line utility to manage NAT-PMP and PCP port mappings.
+/// A simple command line utility to manage NAT-PMP, PCP, and UPnP port mappings.
 #[derive(clap::Parser)]
 struct Cli {
     /// Delete the port mapping on exit. Useful only for testing/debugging.

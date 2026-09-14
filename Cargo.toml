@@ -13,7 +13,7 @@ displaydoc = "0.2.6"
 num_enum = "0.7.6"
 rand = "0.10.2"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["io-util", "net", "time"] }
+tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "time"] }
 tracing = { version = "0.1.44", optional = true }
 
 [dev-dependencies]

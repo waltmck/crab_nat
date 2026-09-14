@@ -245,6 +245,21 @@ impl From<RequestSendError> for Failure {
         }
     }
 }
+impl Failure {
+    /// The number of seconds the server estimates its error condition will persist, if it gave one.
+    /// On error responses, the lifetime field holds this estimate, see <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>.
+    #[must_use]
+    pub fn retry_after_seconds(&self) -> Option<u32> {
+        match self {
+            Failure::NotAuthorized(seconds)
+            | Failure::NetworkFailure(seconds)
+            | Failure::NoResources(seconds)
+            | Failure::UserExceededQuota(seconds)
+            | Failure::CannotProvideExternal(seconds) => Some(*seconds),
+            _ => None,
+        }
+    }
+}
 
 /// The values that must be explicitly defined for all PCP single-port and peer mapping requests.
 #[derive(Clone, Copy)]
@@ -537,7 +552,7 @@ pub async fn peer_mapping(
         session_nonce.unwrap_or_else(|| [rand::random(), rand::random(), rand::random()]);
 
     // Create a new UDP socket to communicate with the gateway.
-    let socket = helpers::new_socket(base.gateway)
+    let socket = helpers::new_socket(base.gateway, crate::GATEWAY_PORT)
         .await
         .map_err(Failure::Socket)?;
 
@@ -833,7 +848,7 @@ async fn try_send_map_request(
     recv_buffer: &mut [u8; MAX_DATAGRAM_SIZE],
 ) -> Result<PcpResponse<'_>, Failure> {
     // Create a new UDP socket to communicate with the gateway.
-    let socket = helpers::new_socket(gateway)
+    let socket = helpers::new_socket(gateway, crate::GATEWAY_PORT)
         .await
         .map_err(Failure::Socket)?;
 

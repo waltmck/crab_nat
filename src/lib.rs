@@ -1,6 +1,6 @@
 //! # 🦀 NAT
 
-//! A library providing a pure Rust implementation of a client for both the NAT Port Mapping Protocol (NAT-PMP, [RFC 6886](https://www.rfc-editor.org/rfc/rfc6886)) and the Port Control Protocol (PCP, [RFC 6887](https://www.rfc-editor.org/rfc/rfc6887)).
+//! A library providing a pure Rust implementation of a client for the NAT Port Mapping Protocol (NAT-PMP, [RFC 6886](https://www.rfc-editor.org/rfc/rfc6886)), the Port Control Protocol (PCP, [RFC 6887](https://www.rfc-editor.org/rfc/rfc6887)), and the UPnP Internet Gateway Device protocol ([IGD](https://openconnectivity.org/developer/specifications/upnp-resources/upnp/internet-gateway-device-igd-v-2-0/)).
 
 //! This library is intended to feel like high level, idiomatic Rust, while still maintaining a strong focus on performance. It is asynchronous and uses the [tokio](https://tokio.rs) runtime to avoid blocking operations and to succinctly handle timeouts on UDP sockets.
 
@@ -9,10 +9,10 @@
 //! async {
 //!     use std::{net::{IpAddr, Ipv4Addr}, num::NonZeroU16};
 //!     use crab_nat::{InternetProtocol, PortMapping, PortMappingOptions};
-//!     // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
+//!     // Attempt a port mapping request through PCP first, falling back to NAT-PMP and then UPnP.
 //!     let mapping = match PortMapping::new(
 //!         Ipv4Addr::new(192, 168, 1, 1).into(), /* Address of the PCP server, often a gateway or firewall */
-//!         Ipv4Addr::new(192, 168, 1, 167).into(), /* Address of our client, as seen by the gateway. Only strictly necessary for PCP */
+//!         Ipv4Addr::new(192, 168, 1, 167).into(), /* Address of our client, as seen by the gateway. Only strictly necessary for PCP and UPnP */
 //!         InternetProtocol::Tcp, /* Protocol to map */
 //!         NonZeroU16::new(8080).unwrap(), /* Internal port, cannot be zero */
 //!         PortMappingOptions::default(), /* Optional configuration values, including suggested external port and lifetimes */
@@ -34,12 +34,13 @@
 //! };
 //! ```
 
-use std::{net::IpAddr, num::NonZeroU16};
+use std::{net::IpAddr, num::NonZeroU16, time::Duration};
 
 use num_enum::TryFromPrimitive;
 
 pub mod natpmp;
 pub mod pcp;
+pub mod upnp;
 
 // The RFC for NAT-PMP states that connections SHOULD make up to 9 attempts, <https://www.rfc-editor.org/rfc/rfc6886#section-3.1> page 6.
 // The RFC for PCP states that connections SHOULD make attempts without a limit, <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> page 22.
@@ -51,6 +52,16 @@ pub const GATEWAY_PORT: u16 = 5351;
 
 /// The RFC recommended lifetime for a port mapping, <https://www.rfc-editor.org/rfc/rfc6886#section-3.3> page 12.
 pub const RECOMMENDED_MAPPING_LIFETIME_SECONDS: u32 = 7200;
+
+/// The `TimeoutConfig` used for the PCP attempt of the protocol fallback chain when none is given.
+/// Uses a shorter initial timeout than the RFC-flavored `pcp::TIMEOUT_CONFIG_DEFAULT`, since
+/// gateways on the local network respond within milliseconds and the chain has fallback
+/// protocols left to attempt. Calls to `pcp::port_mapping(..)` directly keep the RFC timing.
+const CHAIN_PCP_TIMEOUT_CONFIG: TimeoutConfig = TimeoutConfig {
+    initial_timeout: Duration::from_millis(500),
+    max_retries: SANE_MAX_REQUEST_RETRIES,
+    max_retry_timeout: None,
+};
 
 /// 8-bit version field in the NAT-PMP and PCP headers.
 #[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive)]
@@ -86,7 +97,7 @@ pub enum InternetProtocol {
 }
 
 /// Specifies a port mapping protocol, as well as any protocol specific parameters.
-#[derive(Clone, Copy, Debug, displaydoc::Display)]
+#[derive(Clone, Debug, displaydoc::Display)]
 pub enum PortMappingType {
     /// NAT-PMP
     NatPmp,
@@ -99,6 +110,18 @@ pub enum PortMappingType {
         /// The nonce used to identify this session with the PCP server.
         /// A unique nonce may be used for each mapping, see <https://www.rfc-editor.org/rfc/rfc6887#page-44>.
         nonce: pcp::Nonce,
+
+        /// The external IP address of the client.
+        external_ip: IpAddr,
+    },
+
+    /// UPnP
+    Upnp {
+        /// Our address as seen by the gateway. Used as the internal client address of the mapping.
+        client: IpAddr,
+
+        /// The endpoint discovered on the gateway which is used to manage the mapping.
+        endpoint: upnp::ControlEndpoint,
 
         /// The external IP address of the client.
         external_ip: IpAddr,
@@ -201,50 +224,192 @@ pub struct PortMapping {
     pub timeout_config: TimeoutConfig,
 }
 impl PortMapping {
-    /// Attempts to map a port on the gateway using PCP first and falling back to NAT-PMP.
+    /// Attempts to map a port on the gateway using PCP first, falling back to NAT-PMP and then UPnP.
     /// Will request to use the given external port if specified, otherwise it will let the gateway choose.
     /// If no lifetime is specified, the NAT-PMP recommended lifetime of two hours will be used.
+    /// # Notes
+    /// NAT-PMP is attempted when the PCP server recommends it with an unsupported version response,
+    /// as well as when the PCP exchange suggests the responder may only speak NAT-PMP correctly:
+    /// an invalid response, or a rejection of the request as malformed, unauthorized, or mismatched.
+    /// When PCP goes unanswered entirely, NAT-PMP is attempted only if a stateless probe made
+    /// concurrently with the PCP request demonstrated a NAT-PMP responder on the gateway.
+    /// UPnP is attempted when the earlier protocols are ruled out as above, or when an attempted
+    /// NAT-PMP fallback fails with an error specific to that protocol.
+    /// Failures describing a state shared by all mapping protocols, such as the gateway lacking resources
+    /// or a network failure, are returned without attempting further protocols.
+    ///
+    /// UPnP discovery is started concurrently with the earlier protocols to reduce the latency of
+    /// falling back to it. Discovery creates no state on the gateway and is abandoned when unused.
+    /// Without an explicit `timeout_config`, the PCP attempt uses a shorter initial timeout than
+    /// `pcp::TIMEOUT_CONFIG_DEFAULT`, since gateways respond within milliseconds and the chain
+    /// has fallback protocols left to attempt.
     /// # Errors
-    /// Returns a `MappingFailure` enum which decomposes into a `NatPmp(natpmp::Failure)` or a `Pcp(pcp::Failure)` depending on which failed.
-    /// Will never return `Pcp(pcp::Failure::UnsupportedVersion(VersionCode::NatPmp))` because NAT-PMP will be used as a fallback in this case.
-    /// If a different `Pcp(_)` error is returned, then *NAT-PMP is likely not supported* by the gateway and this call will not attempt it.
-    /// If you want to still attempt NAT-PMP after PCP fails, you can call `natpmp::port_mapping(..)` directly.
+    /// Returns a `FallbackFailure` containing the `MappingFailure` of the last protocol attempted, which
+    /// decomposes into a `NatPmp(natpmp::Failure)`, `Pcp(pcp::Failure)`, or `Upnp(upnp::Failure)`,
+    /// as well as the time the PCP server estimated its error will persist, if it gave one.
+    /// If you want control over exactly which protocols are attempted, you can call
+    /// `pcp::port_mapping(..)`, `natpmp::port_mapping(..)`, or `upnp::port_mapping(..)` directly.
     pub async fn new(
         gateway: GatewayAddress,
         client: IpAddr,
         protocol: InternetProtocol,
         internal_port: NonZeroU16,
         mapping_options: PortMappingOptions,
-    ) -> Result<Self, MappingFailure> {
-        // Try to use PCP first, as recommended by the RFC in the last paragraph of section 1.1 <https://www.rfc-editor.org/rfc/rfc6886#page-5>.
-        match pcp::port_mapping(
-            pcp::BaseMapRequest::new(gateway, client, protocol, internal_port),
-            None,
-            None,
-            mapping_options,
-        )
-        .await
-        {
-            // If we succeed, return the mapping.
-            Ok(m) => return Ok(m),
-
-            // If the gateway does not support PCP, but is recommending NAT-PMP, then fall back silently.
-            Err(pcp::Failure::UnsupportedVersion(VersionCode::NatPmp)) => {}
-
-            // Otherwise, return the error.
-            Err(e) => return Err(e.into()),
+    ) -> Result<Self, FallbackFailure> {
+        /// The result of attempting the PCP, and possibly NAT-PMP, steps of the fallback chain.
+        enum ChainAttempt {
+            Mapped(Box<PortMapping>),
+            Failed(FallbackFailure),
+            TryUpnp { retry_after_seconds: Option<u32> },
         }
 
-        // Fall back to the older, possibly more widely supported, NAT-PMP.
-        natpmp::port_mapping(gateway, protocol, internal_port, mapping_options)
-            .await
-            .map_err(std::convert::Into::into)
+        // Attempt the protocols sharing the gateway port in their fallback order.
+        let chain = async {
+            // Probe for a NAT-PMP responder concurrently with the PCP attempt, using a stateless
+            // external address request. The probe decides whether NAT-PMP is worth attempting when
+            // PCP goes unanswered: relying on the unsupported version reply required by
+            // <https://www.rfc-editor.org/rfc/rfc6886#section-3.5> would let one lost datagram,
+            // or firmware which silently drops unknown versions, rule out a working NAT-PMP server.
+            let probe = natpmp::external_address(gateway, mapping_options.timeout_config);
+
+            // Try to use PCP first, as recommended by the RFC in the last paragraph of section 1.1 <https://www.rfc-editor.org/rfc/rfc6886#page-5>.
+            let attempt = pcp::port_mapping(
+                pcp::BaseMapRequest::new(gateway, client, protocol, internal_port),
+                None,
+                None,
+                PortMappingOptions {
+                    timeout_config: Some(
+                        mapping_options
+                            .timeout_config
+                            .unwrap_or(CHAIN_PCP_TIMEOUT_CONFIG),
+                    ),
+                    ..mapping_options
+                },
+            );
+
+            // Drive the probe alongside the PCP attempt; its result is read only when needed.
+            let mut probe = std::pin::pin!(probe);
+            let mut attempt = std::pin::pin!(attempt);
+            let mut natpmp_answered = None;
+            let e = loop {
+                let result = if natpmp_answered.is_none() {
+                    tokio::select! {
+                        result = &mut attempt => result,
+                        probed = &mut probe => {
+                            natpmp_answered = Some(probed.is_ok());
+                            continue;
+                        }
+                    }
+                } else {
+                    attempt.as_mut().await
+                };
+                match result {
+                    Ok(m) => return ChainAttempt::Mapped(Box::new(m)),
+                    Err(e) => break e,
+                }
+            };
+
+            // Keep the "retry after" estimate reported by the PCP server, if any, for the returned failure.
+            let retry_after_seconds = e.retry_after_seconds();
+            let attempt_natpmp = match pcp_failure_fallback(&e) {
+                // Return errors describing a state shared by all mapping protocols.
+                PcpFallback::None => {
+                    return ChainAttempt::Failed(FallbackFailure {
+                        failure: e.into(),
+                        retry_after_seconds,
+                    })
+                }
+
+                PcpFallback::NatPmp => true,
+
+                // The gateway did not answer PCP usefully; only attempt NAT-PMP if the
+                // concurrent probe demonstrated a responder.
+                PcpFallback::Upnp => match natpmp_answered {
+                    Some(answered) => answered,
+                    None => probe.await.is_ok(),
+                },
+            };
+
+            // Fall back to the older, possibly more widely supported, NAT-PMP.
+            if attempt_natpmp {
+                match natpmp::port_mapping(gateway, protocol, internal_port, mapping_options).await
+                {
+                    Ok(m) => return ChainAttempt::Mapped(Box::new(m)),
+
+                    // Fall through to UPnP for failures specific to the NAT-PMP protocol.
+                    Err(e) if natpmp_failure_is_protocol_specific(&e) => {}
+
+                    // Otherwise, return the error.
+                    Err(e) => {
+                        return ChainAttempt::Failed(FallbackFailure {
+                            failure: e.into(),
+                            retry_after_seconds,
+                        })
+                    }
+                }
+            }
+
+            ChainAttempt::TryUpnp {
+                retry_after_seconds,
+            }
+        };
+
+        // Begin UPnP discovery concurrently so that falling back to it does not have to wait for
+        // the exchanges above. Discovery creates no state on the gateway if it goes unused.
+        let discovery = upnp::discover_gateway(gateway, mapping_options.timeout_config);
+
+        let mut chain = std::pin::pin!(chain);
+        let mut discovery = std::pin::pin!(discovery);
+        let mut discovered = None;
+        let attempt = loop {
+            if discovered.is_none() {
+                tokio::select! {
+                    attempt = &mut chain => break attempt,
+                    result = &mut discovery => discovered = Some(result),
+                }
+            } else {
+                break chain.as_mut().await;
+            }
+        };
+
+        let retry_after_seconds = match attempt {
+            ChainAttempt::Mapped(m) => return Ok(*m),
+            ChainAttempt::Failed(f) => return Err(f),
+            ChainAttempt::TryUpnp {
+                retry_after_seconds,
+            } => retry_after_seconds,
+        };
+
+        // Fall back to UPnP, which is often available on gateways that have PCP and NAT-PMP disabled.
+        // UPnP servers do not give "retry after" estimates; keep any reported by the earlier protocols.
+        let endpoint = match discovered {
+            Some(result) => result,
+            None => discovery.await,
+        };
+        match endpoint {
+            Ok(endpoint) => {
+                upnp::port_mapping_with_endpoint(
+                    gateway,
+                    &endpoint,
+                    client,
+                    protocol,
+                    internal_port,
+                    mapping_options,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        }
+        .map_err(|e| FallbackFailure {
+            failure: e.into(),
+            retry_after_seconds,
+        })
     }
 
     /// Attempts to renew this port mapping on the gateway, otherwise returns an error.
     /// # Errors
-    /// Returns a `MappingFailure` enum which decomposes into a `NatPmp(natpmp::Failure)` or a `Pcp(pcp::Failure)`
-    /// depending on which protocol was used to create the mapping.
+    /// Returns a `MappingFailure` enum which decomposes into a `NatPmp(natpmp::Failure)`,
+    /// `Pcp(pcp::Failure)`, or `Upnp(upnp::Failure)` depending on which protocol was used to create the mapping.
     pub async fn renew(&mut self) -> Result<(), MappingFailure> {
         // The optional configuration values for the port mapping request.
         let options = PortMappingOptions {
@@ -254,40 +419,80 @@ impl PortMapping {
         };
 
         // Attempt to renew the existing port mapping on the gateway.
-        match self.mapping_type {
+        let renewed = match self.mapping_type.clone() {
             PortMappingType::NatPmp => {
-                *self =
-                    natpmp::port_mapping(self.gateway, self.protocol, self.internal_port, options)
-                        .await
-                        .map_err(MappingFailure::from)?;
+                natpmp::port_mapping(self.gateway, self.protocol, self.internal_port, options)
+                    .await
+                    .map_err(MappingFailure::from)?
             }
             PortMappingType::Pcp {
                 client,
                 nonce,
                 external_ip,
+            } => pcp::port_mapping(
+                pcp::BaseMapRequest::new(self.gateway, client, self.protocol, self.internal_port),
+                Some(nonce),
+                Some(external_ip),
+                options,
+            )
+            .await
+            .map_err(MappingFailure::from)?,
+            PortMappingType::Upnp {
+                client, endpoint, ..
             } => {
-                *self = pcp::port_mapping(
-                    pcp::BaseMapRequest::new(
+                match upnp::port_mapping_with_endpoint(
+                    self.gateway,
+                    &endpoint,
+                    client,
+                    self.protocol,
+                    self.internal_port,
+                    options,
+                )
+                .await
+                {
+                    Ok(m) => m,
+
+                    // The stored endpoint may be stale: some gateways host their control URL
+                    // on a new port after each reboot. Retry once with a fresh discovery.
+                    Err(
+                        upnp::Failure::Socket(_)
+                        | upnp::Failure::Timeout
+                        | upnp::Failure::HttpStatus(404),
+                    ) => upnp::port_mapping(
                         self.gateway,
                         client,
                         self.protocol,
                         self.internal_port,
-                    ),
-                    Some(nonce),
-                    Some(external_ip),
-                    options,
-                )
-                .await
-                .map_err(MappingFailure::from)?;
+                        options,
+                    )
+                    .await
+                    .map_err(MappingFailure::from)?,
+
+                    Err(e) => return Err(e.into()),
+                }
             }
+        };
+
+        // A decreased gateway epoch suggests the gateway rebooted and lost its mappings.
+        // This renewal recreated its own mapping, but others made earlier should also be renewed.
+        // See <https://www.rfc-editor.org/rfc/rfc6887#section-8.5>.
+        #[cfg(feature = "tracing")]
+        if renewed.gateway_epoch_seconds < self.gateway_epoch_seconds {
+            tracing::warn!(
+                "Gateway epoch decreased from {} to {}; the gateway may have rebooted and dropped its other mappings",
+                self.gateway_epoch_seconds,
+                renewed.gateway_epoch_seconds
+            );
         }
+
+        *self = renewed;
         Ok(())
     }
 
     /// Attempts to safely delete this port mapping on the gateway, otherwise returns an error and the `PortMapping` back.
     /// # Errors
-    /// Returns a `MappingFailure` enum which decomposes into `NatPmp(natpmp::Failure)` and `Pcp(pcp::Failure)`
-    /// depending on which protocol was used to create the mapping.
+    /// Returns a `MappingFailure` enum which decomposes into `NatPmp(natpmp::Failure)`, `Pcp(pcp::Failure)`,
+    /// and `Upnp(upnp::Failure)` depending on which protocol was used to create the mapping.
     pub async fn try_drop(self) -> Result<(), (MappingFailure, Self)> {
         let gateway = self.gateway();
         let protocol = self.protocol();
@@ -313,6 +518,15 @@ impl PortMapping {
                     internal_port,
                     protocol,
                 },
+                Some(self.timeout_config),
+            )
+            .await
+            .map_err(|e| (MappingFailure::from(e), self)),
+
+            PortMappingType::Upnp { endpoint, .. } => upnp::try_drop_mapping(
+                &endpoint,
+                protocol,
+                self.external_port(),
                 Some(self.timeout_config),
             )
             .await
@@ -351,6 +565,7 @@ impl PortMapping {
         self.external_port
     }
     /// The lifetime of the port mapping in seconds.
+    /// A lifetime of `0` indicates a permanent mapping, which only UPnP gateways may create.
     #[must_use]
     pub fn lifetime(&self) -> u32 {
         self.lifetime_seconds
@@ -361,14 +576,24 @@ impl PortMapping {
         self.expiration
     }
     /// The gateway epoch time when the port mapping was created.
+    /// UPnP does not share an epoch, so this is always `0` for UPnP mappings.
     #[must_use]
     pub fn gateway_epoch(&self) -> u32 {
         self.gateway_epoch_seconds
     }
     /// The type of mapping protocol used, as well as any protocol specific parameters.
+    /// Note that NAT-PMP responses do not include the external IP address of the mapping;
+    /// it can be requested separately with `natpmp::external_address(..)`.
     #[must_use]
     pub fn mapping_type(&self) -> PortMappingType {
-        self.mapping_type
+        self.mapping_type.clone()
+    }
+
+    /// The datetime after which the port mapping should be renewed, using this machine's clock.
+    /// Renewal halfway through the lifetime is recommended by the RFC, see <https://www.rfc-editor.org/rfc/rfc6886#page-13>.
+    #[must_use]
+    pub fn renew_after(&self) -> std::time::Instant {
+        self.expiration - Duration::from_secs(u64::from(self.lifetime_seconds) / 2)
     }
 }
 
@@ -378,32 +603,45 @@ mod helpers {
     use std::time::Duration;
     use tokio::net::UdpSocket;
 
-    /// Create a new UDP socket and "connect" it to the gateway socket address for NAT-PMP or PCP.
+    /// The socket address of the gateway at the given port, including any IPv6 scope ID.
+    #[must_use]
+    pub fn socket_address(gateway: GatewayAddress, port: u16) -> std::net::SocketAddr {
+        use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+
+        match gateway {
+            GatewayAddress::IpV4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, port)),
+            GatewayAddress::IpV6(v6, scope_id) => {
+                SocketAddr::V6(SocketAddrV6::new(v6, port, 0, scope_id.unwrap_or(0)))
+            }
+        }
+    }
+
+    /// Create a new UDP socket with an IP protocol matching that of the gateway address.
     /// # Errors
-    /// Will return an error if we fail to bind to a local UDP socket or connect to the gateway address.
-    pub async fn new_socket(
+    /// Will return an error if we fail to bind to a local UDP socket.
+    pub async fn bind_socket(
         gateway: GatewayAddress,
     ) -> Result<tokio::net::UdpSocket, std::io::Error> {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-        // Create a new UDP with an IP protocol matching that of the gateway address.
-        let socket = tokio::net::UdpSocket::bind(match &gateway {
+        tokio::net::UdpSocket::bind(match &gateway {
             GatewayAddress::IpV4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             GatewayAddress::IpV6(_, _) => {
                 SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
             }
         })
-        .await?;
-        let destination = match gateway {
-            GatewayAddress::IpV4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, crate::GATEWAY_PORT)),
-            GatewayAddress::IpV6(v6, scope_id) => SocketAddr::V6(SocketAddrV6::new(
-                v6,
-                crate::GATEWAY_PORT,
-                0,
-                scope_id.unwrap_or(0),
-            )),
-        };
-        socket.connect(destination).await?;
+        .await
+    }
+
+    /// Create a new UDP socket and "connect" it to the given port on the gateway.
+    /// # Errors
+    /// Will return an error if we fail to bind to a local UDP socket or connect to the gateway address.
+    pub async fn new_socket(
+        gateway: GatewayAddress,
+        port: u16,
+    ) -> Result<tokio::net::UdpSocket, std::io::Error> {
+        let socket = bind_socket(gateway).await?;
+        socket.connect(socket_address(gateway, port)).await?;
 
         Ok(socket)
     }
@@ -507,4 +745,112 @@ pub enum MappingFailure {
 
     #[error("PCP({0})")]
     Pcp(#[from] pcp::Failure),
+
+    #[error("UPnP({0})")]
+    Upnp(#[from] upnp::Failure),
+}
+
+/// The failure returned when `PortMapping::new` has exhausted its protocol fallback chain.
+#[derive(Debug, thiserror::Error)]
+#[error("{failure}{}", .retry_after_seconds.map_or_else(String::new, |s| format!(" (PCP server estimates the error will persist for {s} seconds)")))]
+pub struct FallbackFailure {
+    /// The failure returned by the last protocol attempted.
+    #[source]
+    pub failure: MappingFailure,
+
+    /// The number of seconds the PCP server estimated its error will persist, when it reported one.
+    /// NAT-PMP and UPnP servers do not give such estimates, see `pcp::Failure::retry_after_seconds`.
+    pub retry_after_seconds: Option<u32>,
+}
+
+/// Whether a socket error indicates that nothing is listening on the port we sent a datagram to.
+/// The ICMP rejection is reported as `ConnectionRefused` on most platforms, but as
+/// `ConnectionReset` on Windows.
+fn is_port_closed_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// The protocol `PortMapping::new` should attempt next after a PCP failure.
+enum PcpFallback {
+    /// The failure describes a state shared by all mapping protocols; no fallback will help.
+    None,
+
+    /// The gateway recommended NAT-PMP, or the responder may only speak NAT-PMP correctly.
+    NatPmp,
+
+    /// NAT-PMP was ruled out along with PCP, but UPnP may still be available.
+    Upnp,
+}
+
+/// Categorize which fallback protocol, if any, may still succeed after the given PCP failure.
+/// Errors describing a state shared by all mapping protocols, e.g. the gateway lacking resources
+/// for a new mapping or experiencing a network failure, do not benefit from a fallback.
+fn pcp_failure_fallback(failure: &pcp::Failure) -> PcpFallback {
+    match failure {
+        // The gateway explicitly recommends a version downgrade, gave a response we could not
+        // understand, or rejected the request itself. The responder may only speak NAT-PMP correctly.
+        pcp::Failure::UnsupportedVersion(_)
+        | pcp::Failure::InvalidResponse(_)
+        | pcp::Failure::Nonce
+        | pcp::Failure::MalformedRequest
+        | pcp::Failure::NotAuthorized(_) => PcpFallback::NatPmp,
+
+        // The client address we sent does not match the address the server saw, so no plain PCP
+        // request can succeed. NAT-PMP requests carry no client address and always map the
+        // address the gateway sees, so it cannot fail the same way.
+        pcp::Failure::AddressMismatch => PcpFallback::NatPmp,
+
+        // Nothing responded in time. NAT-PMP servers are required to answer requests with an
+        // unknown version using an "unsupported version" error (<https://www.rfc-editor.org/rfc/rfc6886#section-3.5>),
+        // and PCP relies on that reply for downgrades (<https://www.rfc-editor.org/rfc/rfc6887#section-9>),
+        // so a silent gateway is assumed not to speak NAT-PMP either.
+        pcp::Failure::Timeout => PcpFallback::Upnp,
+
+        // The gateway speaks well-formed PCP but cannot serve this request; it would have
+        // recommended NAT-PMP with an unsupported version response if it preferred it.
+        pcp::Failure::UnsupportedOpcode
+        | pcp::Failure::UnsupportedOption
+        | pcp::Failure::MalformedOption
+        | pcp::Failure::UnsupportedProtocol => PcpFallback::Upnp,
+
+        // A rejection indicates that the gateway does not listen on the port NAT-PMP and PCP
+        // share. Other socket errors are local or environmental and would affect any protocol.
+        pcp::Failure::Socket(e) => {
+            if is_port_closed_error(e) {
+                PcpFallback::Upnp
+            } else {
+                PcpFallback::None
+            }
+        }
+
+        // The gateway state or the request itself would cause any mapping protocol to fail.
+        pcp::Failure::NetworkFailure(_)
+        | pcp::Failure::NoResources(_)
+        | pcp::Failure::UserExceededQuota(_)
+        | pcp::Failure::CannotProvideExternal(_)
+        | pcp::Failure::ExcessiveRemotePeers => PcpFallback::None,
+    }
+}
+
+/// Whether a NAT-PMP failure is specific to the NAT-PMP protocol, meaning a fallback protocol may still succeed.
+/// See `pcp_failure_fallback` for the reasoning behind the categorization.
+fn natpmp_failure_is_protocol_specific(failure: &natpmp::Failure) -> bool {
+    match failure {
+        // Nothing intelligible is answering NAT-PMP requests, or the server refused to process ours.
+        natpmp::Failure::Timeout
+        | natpmp::Failure::InvalidResponse(_)
+        | natpmp::Failure::UnsupportedVersion(_)
+        | natpmp::Failure::NotAuthorized
+        | natpmp::Failure::UnsupportedOpcode => true,
+
+        // A rejection indicates that the gateway does not listen on the NAT-PMP port at all.
+        // Other socket errors are local or environmental and would affect any protocol.
+        natpmp::Failure::Socket(e) => is_port_closed_error(e),
+
+        // The gateway state would cause any mapping protocol to fail.
+        natpmp::Failure::NetworkFailure | natpmp::Failure::OutOfResources => false,
+    }
 }
