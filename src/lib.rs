@@ -57,6 +57,27 @@ pub const ANNOUNCEMENT_PORT: u16 = 5350;
 /// The RFC recommended lifetime for a port mapping, <https://www.rfc-editor.org/rfc/rfc6886#section-3.3> page 12.
 pub const RECOMMENDED_MAPPING_LIFETIME_SECONDS: u32 = 7200;
 
+/// The firewall mark applied to sockets created by this library, where `0` means no mark is set.
+static FWMARK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Sets the firewall mark (`SO_MARK`) applied to all sockets this library creates from now on.
+/// Marks let routing and firewall rules classify this library's traffic, e.g. to route
+/// requests toward the gateway around a VPN which would otherwise capture them.
+/// A mark of `0`, the initial value, leaves sockets unmarked.
+/// # Notes
+/// Marks only exist on Linux and Android; the value is ignored elsewhere. Setting a mark
+/// requires the `CAP_NET_ADMIN` capability, without which socket creation will fail rather
+/// than send traffic without its mark.
+pub fn set_fwmark(fwmark: u32) {
+    FWMARK.store(fwmark, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The firewall mark currently applied to sockets this library creates, where `0` means none.
+#[must_use]
+pub fn fwmark() -> u32 {
+    FWMARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The `TimeoutConfig` used for the PCP attempt of the protocol fallback chain when none is given.
 /// Uses a shorter initial timeout than the RFC-flavored `pcp::TIMEOUT_CONFIG_DEFAULT`, since
 /// gateways on the local network respond within milliseconds and the chain has fallback
@@ -849,10 +870,11 @@ impl AddressChangeListener {
         let timeout = upnp::tcp_timeout(timeout_config);
 
         // Subscribe to the state change events of the gateway's WAN connection service.
-        let callback =
-            tokio::net::TcpListener::bind((client, callback_port.map_or(0, NonZeroU16::get)))
-                .await
-                .map_err(ListenerFailure::Socket)?;
+        let callback = helpers::bind_tcp_listener(std::net::SocketAddr::new(
+            client,
+            callback_port.map_or(0, NonZeroU16::get),
+        ))
+        .map_err(ListenerFailure::Socket)?;
         let callback_address = callback.local_addr().map_err(ListenerFailure::Socket)?;
         let subscription = upnp::subscribe(event_url, callback_address, timeout).await?;
 
@@ -1124,21 +1146,46 @@ mod helpers {
         }
     }
 
+    /// Apply the configured firewall mark, if any, to a socket before it is used.
+    /// See `crate::set_fwmark`; marks only exist on some platforms.
+    fn apply_fwmark(socket: &socket2::Socket) -> Result<(), std::io::Error> {
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            let fwmark = crate::fwmark();
+            if fwmark != 0 {
+                socket.set_mark(fwmark)?;
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        let _ = socket;
+
+        Ok(())
+    }
+
     /// Create a new UDP socket with an IP protocol matching that of the gateway address.
     /// # Errors
-    /// Will return an error if we fail to bind to a local UDP socket.
-    pub async fn bind_socket(
-        gateway: GatewayAddress,
-    ) -> Result<tokio::net::UdpSocket, std::io::Error> {
+    /// Will return an error if we fail to bind to a local UDP socket or to apply a firewall mark.
+    pub fn bind_socket(gateway: GatewayAddress) -> Result<tokio::net::UdpSocket, std::io::Error> {
+        use socket2::{Domain, Protocol, Socket, Type};
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-        tokio::net::UdpSocket::bind(match &gateway {
-            GatewayAddress::IpV4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            GatewayAddress::IpV6(_, _) => {
-                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
-            }
-        })
-        .await
+        let (domain, bind_address) = match &gateway {
+            GatewayAddress::IpV4(_) => (
+                Domain::IPV4,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            ),
+            GatewayAddress::IpV6(_, _) => (
+                Domain::IPV6,
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+            ),
+        };
+
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        apply_fwmark(&socket)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&bind_address.into())?;
+
+        tokio::net::UdpSocket::from_std(socket.into())
     }
 
     /// Create a new UDP socket and "connect" it to the given port on the gateway.
@@ -1148,10 +1195,55 @@ mod helpers {
         gateway: GatewayAddress,
         port: u16,
     ) -> Result<tokio::net::UdpSocket, std::io::Error> {
-        let socket = bind_socket(gateway).await?;
+        let socket = bind_socket(gateway)?;
         socket.connect(socket_address(gateway, port)).await?;
 
         Ok(socket)
+    }
+
+    /// Open a TCP connection to the given address, applying the configured firewall mark.
+    /// # Errors
+    /// Will return an error if we fail to create the socket or connect to the address.
+    pub async fn connect_tcp(
+        address: std::net::SocketAddr,
+    ) -> Result<tokio::net::TcpStream, std::io::Error> {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let domain = if address.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        apply_fwmark(&socket)?;
+        socket.set_nonblocking(true)?;
+
+        tokio::net::TcpSocket::from_std_stream(socket.into())
+            .connect(address)
+            .await
+    }
+
+    /// Create a TCP listener bound to the given address, applying the configured firewall mark.
+    /// Connections accepted from the listener inherit the mark for their responses.
+    /// # Errors
+    /// Will return an error if we fail to bind or listen on the address.
+    pub fn bind_tcp_listener(
+        address: std::net::SocketAddr,
+    ) -> Result<tokio::net::TcpListener, std::io::Error> {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let domain = if address.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        apply_fwmark(&socket)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&address.into())?;
+        socket.listen(1024)?;
+
+        tokio::net::TcpListener::from_std(socket.into())
     }
 
     /// Create a UDP socket listening for multicast gateway announcements on the announcement port.
@@ -1187,6 +1279,7 @@ mod helpers {
         };
 
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        apply_fwmark(&socket)?;
         socket.set_reuse_address(true)?;
         #[cfg(all(
             unix,

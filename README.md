@@ -47,6 +47,9 @@ The announcement listener follows the RFC's guidance of sharing its port, so mul
 
 Even without a listener, a stale external address is corrected whenever a mapping is renewed: `PortMapping::renew` refreshes the address reported by `PortMapping::external_ip`.
 
+### Firewall marks
+On Linux and Android, `crab_nat::set_fwmark` sets the firewall mark (`SO_MARK`) applied to every socket this library creates, letting routing and firewall rules classify the traffic — most commonly to route requests toward the gateway around a VPN that would otherwise capture them. Setting a mark requires the `CAP_NET_ADMIN` capability; without it, socket creation fails rather than sending traffic without its mark.
+
 ### Crate Features
 * `tracing`: Enables logging of UDP packet retry attempts using the [tracing](https://github.com/tokio-rs/tracing) crate. This currently only shows UDP retry attempts at an `INFO` verbosity level.
 

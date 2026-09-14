@@ -408,9 +408,7 @@ pub async fn discover_gateway(
     // Create a new UDP socket without connecting it: some device implementations respond to
     // search requests from an ephemeral port or a different address, so responses are judged
     // by their source address instead of relying on the socket to filter them.
-    let socket = helpers::bind_socket(gateway)
-        .await
-        .map_err(Failure::Socket)?;
+    let socket = helpers::bind_socket(gateway).map_err(Failure::Socket)?;
     let destination = helpers::socket_address(gateway, DISCOVERY_PORT);
     let gateway_ip = IpAddr::from(gateway);
 
@@ -1235,7 +1233,7 @@ async fn http_request(
 ) -> Result<HttpResponse, Failure> {
     let exchange = async {
         // Open a new TCP connection to the gateway and send the request.
-        let mut stream = tokio::net::TcpStream::connect(address)
+        let mut stream = helpers::connect_tcp(address)
             .await
             .map_err(Failure::Socket)?;
         stream.write_all(request).await.map_err(Failure::Socket)?;
