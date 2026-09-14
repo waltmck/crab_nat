@@ -18,6 +18,9 @@ pub const REQUEST_DATAGRAM_SIZE: usize = 12;
 /// Mapping responses have datagrams of size 16 bytes, see <https://www.rfc-editor.org/rfc/rfc6886#section-3.3>.
 pub const RESPONSE_DATAGRAM_SIZE: usize = 16;
 
+/// External address responses have datagrams of size 12 bytes, see <https://www.rfc-editor.org/rfc/rfc6886#section-3.2>.
+pub const ADDRESS_RESPONSE_SIZE: usize = 12;
+
 /// The default `TimeoutConfig` for NAT-PMP requests.
 pub const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
     initial_timeout: Duration::from_millis(FIRST_TIMEOUT_MILLIS),
@@ -179,9 +182,17 @@ pub async fn external_address(
     gateway: GatewayAddress,
     timeout_config: Option<TimeoutConfig>,
 ) -> Result<Ipv4Addr, Failure> {
-    /// External address responses have datagrams of size 12 bytes, see <https://www.rfc-editor.org/rfc/rfc6886#section-3.2>.
-    const ADDRESS_RESPONSE_SIZE: usize = 12;
+    external_address_with_epoch(gateway, timeout_config)
+        .await
+        .map(|(external_ip, _)| external_ip)
+}
 
+/// Attempt to complete the `ExternalAddress` operation, also returning the gateway epoch,
+/// which is used to detect gateway state resets.
+pub(crate) async fn external_address_with_epoch(
+    gateway: GatewayAddress,
+    timeout_config: Option<TimeoutConfig>,
+) -> Result<(Ipv4Addr, u32), Failure> {
     // Create a new UDP socket and connect to the gateway.
     let socket = helpers::new_socket(gateway, crate::GATEWAY_PORT)
         .await
@@ -221,7 +232,7 @@ pub async fn external_address(
     // Read and verify the result code.
     let result_code = ResultCode::try_from(reader.get_u16())
         .map_err(|e| InvalidResponseKind::InvalidResultCode(e.number))?;
-    let _gateway_epoch_seconds = reader.get_u32();
+    let gateway_epoch_seconds = reader.get_u32();
 
     // Map error result codes to a failure, otherwise continue.
     code_to_result(result_code, v)?;
@@ -239,16 +250,43 @@ pub async fn external_address(
         reader.get_u8(),
     );
 
-    Ok(external_ip)
+    Ok((external_ip, gateway_epoch_seconds))
 }
 
 /// Attempts to map a port on the gateway using NAT-PMP.
 /// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.
 /// Will request the specified lifetime if it is `Some`, otherwise it will use the RFC recommended lifetime.
+/// # Notes
+/// NAT-PMP mapping responses do not include the external IP address of the mapping, so an
+/// `ExternalAddress` request is made first to be able to report it, as reference implementations do.
 /// # Errors
 /// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
 pub async fn port_mapping(
     gateway: GatewayAddress,
+    protocol: InternetProtocol,
+    internal_port: NonZeroU16,
+    mapping_options: PortMappingOptions,
+) -> Result<PortMapping, Failure> {
+    // Request the external address before creating the mapping.
+    let external_ip = external_address(gateway, mapping_options.timeout_config).await?;
+
+    port_mapping_with_external_address(
+        gateway,
+        external_ip,
+        protocol,
+        internal_port,
+        mapping_options,
+    )
+    .await
+}
+
+/// Attempts to map a port on the gateway using NAT-PMP and an already known external address.
+/// Used to avoid a repeated `ExternalAddress` request, see `natpmp::port_mapping` for details.
+/// # Errors
+/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
+pub async fn port_mapping_with_external_address(
+    gateway: GatewayAddress,
+    external_ip: Ipv4Addr,
     protocol: InternetProtocol,
     internal_port: NonZeroU16,
     mapping_options: PortMappingOptions,
@@ -267,6 +305,7 @@ pub async fn port_mapping(
         protocol,
         internal_port,
         external_port,
+        external_ip: std::net::IpAddr::V4(external_ip),
         lifetime_seconds,
         expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
         gateway_epoch_seconds,
@@ -436,6 +475,24 @@ async fn port_mapping_internal(
         lifetime_seconds,
         timeout_config,
     })
+}
+
+/// Parse an unsolicited external address change announcement multicast by the gateway.
+/// Announcements share the format of a successful `ExternalAddress` response,
+/// see <https://www.rfc-editor.org/rfc/rfc6886#section-3.2.1>.
+/// Returns the announced external address and gateway epoch, or `None` for other datagrams.
+pub(crate) fn parse_address_announcement(datagram: &[u8]) -> Option<(Ipv4Addr, u32)> {
+    if datagram.len() != ADDRESS_RESPONSE_SIZE
+        || datagram[0] != VersionCode::NatPmp as u8
+        || datagram[1] != (0x80 | OperationCode::ExternalAddress as u8)
+        || u16::from_be_bytes([datagram[2], datagram[3]]) != ResultCode::Success as u16
+    {
+        return None;
+    }
+
+    let epoch_seconds = u32::from_be_bytes([datagram[4], datagram[5], datagram[6], datagram[7]]);
+    let external_ip = Ipv4Addr::new(datagram[8], datagram[9], datagram[10], datagram[11]);
+    Some((external_ip, epoch_seconds))
 }
 
 /// Response `OperationCode`s are the same as the request `OperationCode`s, but with the 128 bit set.

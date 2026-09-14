@@ -339,3 +339,40 @@ fn test_write_base_request_ipv4() {
     // Suggested external IP should be IPv4-mapped unspecified when None
     assert_eq!(suggested_ip, Ipv4Addr::UNSPECIFIED.to_ipv6_mapped());
 }
+
+/// Unsolicited announce responses should yield their server epoch.
+#[test]
+fn test_parse_announce() {
+    let mut announcement = [0u8; HEADER_SIZE];
+    announcement[0] = VersionCode::Pcp as u8;
+    announcement[1] = 0x80 | OperationCode::Announce as u8;
+    announcement[8..12].copy_from_slice(&3000u32.to_be_bytes()); // Server epoch.
+    assert_eq!(parse_announce(&announcement), Some(3000));
+
+    // Error responses and other messages are not announcements.
+    let mut failed = announcement;
+    failed[3] = ResultCode::NetworkFailure as u8;
+    assert_eq!(parse_announce(&failed), None);
+    assert_eq!(parse_announce(&announcement[..12]), None);
+}
+
+/// Epoch observations advancing with the clock are consistent; regressions and jumps are not.
+#[test]
+fn test_epoch_is_consistent() {
+    // The epoch advancing in step with the client clock is consistent, within tolerances.
+    assert!(epoch_is_consistent(100, 1000, 1100));
+    assert!(epoch_is_consistent(100, 1000, 1099));
+    assert!(epoch_is_consistent(0, 1000, 1000));
+    assert!(epoch_is_consistent(0, 1000, 1002));
+
+    // The epoch going backwards by a single second is tolerated for reordered announcements,
+    // but larger regressions indicate a state reset.
+    assert!(epoch_is_consistent(0, 1000, 999));
+    assert!(!epoch_is_consistent(0, 1000, 998));
+    assert!(!epoch_is_consistent(100, 1000, 999));
+    assert!(!epoch_is_consistent(0, 1000, 5));
+
+    // An epoch which advanced far too little or too much indicates a reset as well.
+    assert!(!epoch_is_consistent(1000, 1000, 1010));
+    assert!(!epoch_is_consistent(10, 1000, 2000));
+}

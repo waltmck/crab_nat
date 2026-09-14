@@ -145,6 +145,10 @@ pub enum InvalidResponseKind {
     #[error("Invalid UPnP error response")]
     ErrorResponse,
 
+    /// The gateway accepted an event subscription without assigning it an identifier.
+    #[error("Subscription response is missing an SID header")]
+    MissingSubscriptionId,
+
     /// A tag in the response contained a value that could not be parsed.
     #[error("Invalid value for {tag}: {value}")]
     InvalidValue { tag: &'static str, value: String },
@@ -339,6 +343,16 @@ fn parse_service_version(version: &str) -> Option<u32> {
     }
 }
 
+/// The URL of a service's event subscription endpoint.
+#[derive(Clone, Debug)]
+pub struct EventUrl {
+    /// The socket address of the HTTP server hosting the URL.
+    pub address: SocketAddr,
+
+    /// The absolute path of the URL.
+    pub path: String,
+}
+
 /// The endpoint used to manage port mappings on the gateway, discovered through an SSDP
 /// search and the device description it points to.
 #[derive(Clone, Debug)]
@@ -351,6 +365,10 @@ pub struct ControlEndpoint {
 
     /// The WAN connection service used to manage port mappings.
     pub service: WanService,
+
+    /// The URL used to subscribe to the service's state change events.
+    /// `None` if the service does not offer eventing.
+    pub event_url: Option<EventUrl>,
 }
 
 /// How long to keep collecting further search responses after the first from the gateway,
@@ -628,13 +646,25 @@ async fn control_endpoint_from_location(
     // Resolve the possibly relative control URLs against the location of the device description,
     // or the legacy `URLBase` element if one was given.
     let mut endpoints = Vec::new();
-    for (service, control_url) in services {
+    for service in services {
         let (control_authority, control_path) =
-            resolve_control_url(&control_url, url_base.as_deref(), &authority, &path)?;
+            resolve_control_url(&service.control_url, url_base.as_deref(), &authority, &path)?;
+
+        // A malformed event URL only disables eventing rather than failing the discovery.
+        let event_url = service.event_url.and_then(|event_url| {
+            let (event_authority, event_path) =
+                resolve_control_url(&event_url, url_base.as_deref(), &authority, &path).ok()?;
+            Some(EventUrl {
+                address: repoint_at_gateway(gateway, &event_authority).ok()?,
+                path: event_path,
+            })
+        });
+
         endpoints.push(ControlEndpoint {
             address: repoint_at_gateway(gateway, &control_authority)?,
             control_path,
-            service,
+            service: service.service,
+            event_url,
         });
     }
 
@@ -743,6 +773,7 @@ pub async fn port_mapping_with_endpoint(
         protocol,
         internal_port,
         external_port,
+        external_ip,
         lifetime_seconds,
         expiration: std::time::Instant::now() + lifetime,
         // UPnP does not share a "seconds since boot" epoch the way NAT-PMP and PCP do.
@@ -750,7 +781,6 @@ pub async fn port_mapping_with_endpoint(
         mapping_type: PortMappingType::Upnp {
             client,
             endpoint: endpoint.clone(),
-            external_ip,
         },
         timeout_config,
     })
@@ -1000,7 +1030,7 @@ async fn external_address_internal(
 /// The total timeout to use for a TCP exchange with the gateway.
 /// TCP performs its own retransmission, so requests are made once using the time
 /// the `TimeoutConfig` would allow a first request and its retries.
-fn tcp_timeout(timeout_config: TimeoutConfig) -> Duration {
+pub(crate) fn tcp_timeout(timeout_config: TimeoutConfig) -> Duration {
     timeout_config.initial_timeout.saturating_mul(
         u32::try_from(timeout_config.max_retries)
             .unwrap_or(u32::MAX)
@@ -1082,18 +1112,24 @@ fn authority_port(authority: &str) -> Result<u16, InvalidResponseKind> {
     })
 }
 
-/// The WAN connection services in a device description with their control URLs as written,
-/// and the legacy `URLBase` element if one was given.
-type DescriptionServices = (Vec<(WanService, String)>, Option<String>);
+/// A WAN connection service entry parsed from a device description, with URLs as written.
+#[derive(Debug, PartialEq)]
+struct DescriptionService {
+    service: WanService,
+    control_url: String,
+    event_url: Option<String>,
+}
+
+/// The WAN connection services in a device description and the legacy `URLBase` element if one was given.
+type DescriptionServices = (Vec<DescriptionService>, Option<String>);
 
 /// Find the WAN connection services in a device description, most preferred first.
-/// Returns each service with its control URL as written, and the legacy `URLBase` element if present.
 fn parse_device_description(description: &str) -> Result<DescriptionServices, InvalidResponseKind> {
     // `URLBase` was removed in version 1.1 of the UPnP Device Architecture, but older devices may specify it.
     let url_base = find_tag_value(description, "URLBase").map(decode_xml_entities);
 
     // Scan the `<service>` entries of the nested device lists for WAN connection services.
-    let mut services: Vec<(WanService, String)> = Vec::new();
+    let mut services: Vec<DescriptionService> = Vec::new();
     let mut rest = description;
     while let Some(start) = rest.find("<service>") {
         rest = &rest[start + "<service>".len()..];
@@ -1112,13 +1148,19 @@ fn parse_device_description(description: &str) -> Result<DescriptionServices, In
         let Some(control_url) = find_tag_value(service_block, "controlURL") else {
             continue;
         };
-        services.push((service, decode_xml_entities(control_url)));
+        services.push(DescriptionService {
+            service,
+            control_url: decode_xml_entities(control_url),
+            event_url: find_tag_value(service_block, "eventSubURL")
+                .filter(|url| !url.is_empty())
+                .map(decode_xml_entities),
+        });
     }
 
     if services.is_empty() {
         return Err(InvalidResponseKind::NoWanConnectionService);
     }
-    services.sort_by_key(|(service, _)| std::cmp::Reverse(service.preference()));
+    services.sort_by_key(|service| std::cmp::Reverse(service.service.preference()));
     Ok((services, url_base))
 }
 
@@ -1163,6 +1205,12 @@ struct HttpResponse {
 
     /// The value of the location header, used to follow description redirects.
     location: Option<String>,
+
+    /// The value of the SID header, identifying an event subscription.
+    sid: Option<String>,
+
+    /// The value of the timeout header, e.g. `Second-1800`, used by event subscriptions.
+    timeout: Option<String>,
 
     /// The response body.
     body: String,
@@ -1265,6 +1313,8 @@ fn parse_http_response(raw: &[u8], eof: bool) -> Result<Option<HttpResponse>, In
     let mut content_length = None;
     let mut chunked = false;
     let mut location = None;
+    let mut sid = None;
+    let mut timeout = None;
     for (name, value) in lines.filter_map(|line| line.split_once(':')) {
         let (name, value) = (name.trim(), value.trim());
         if name.eq_ignore_ascii_case("content-length") {
@@ -1277,6 +1327,10 @@ fn parse_http_response(raw: &[u8], eof: bool) -> Result<Option<HttpResponse>, In
             chunked = value.eq_ignore_ascii_case("chunked");
         } else if name.eq_ignore_ascii_case("location") {
             location = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("sid") {
+            sid = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("timeout") {
+            timeout = Some(value.to_string());
         }
     }
 
@@ -1304,6 +1358,8 @@ fn parse_http_response(raw: &[u8], eof: bool) -> Result<Option<HttpResponse>, In
     Ok(Some(HttpResponse {
         status,
         location,
+        sid,
+        timeout,
         body: String::from_utf8_lossy(&body).into_owned(),
     }))
 }
@@ -1427,6 +1483,286 @@ fn decode_xml_entities(value: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+/// The subscription duration requested for event subscriptions, matching the common gateway default.
+const EVENT_TIMEOUT_SECONDS: u32 = 1800;
+
+/// An active event subscription on a gateway service.
+/// See section 4 of the UPnP Device Architecture for the eventing protocol.
+#[derive(Debug)]
+pub(crate) struct EventSubscription {
+    /// The URL the subscription was made at.
+    pub url: EventUrl,
+
+    /// The subscription identifier assigned by the gateway.
+    pub sid: String,
+
+    /// The number of seconds until the subscription expires unless renewed.
+    pub timeout_seconds: u32,
+}
+
+/// Subscribe to state change events of the service at the given event URL.
+/// The gateway will deliver events by connecting to an HTTP server at the callback address.
+pub(crate) async fn subscribe(
+    event_url: &EventUrl,
+    callback: SocketAddr,
+    timeout: Duration,
+) -> Result<EventSubscription, Failure> {
+    let request = format!(
+        "SUBSCRIBE {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         CALLBACK: <http://{callback}/>\r\n\
+         NT: upnp:event\r\n\
+         TIMEOUT: Second-{EVENT_TIMEOUT_SECONDS}\r\n\
+         Connection: close\r\n\r\n",
+        path = event_url.path,
+        host = host_header(&event_url.address),
+        callback = host_header(&callback),
+    );
+    let response = http_request(event_url.address, request.as_bytes(), timeout).await?;
+    if response.status != 200 {
+        return Err(Failure::HttpStatus(response.status));
+    }
+
+    Ok(EventSubscription {
+        url: event_url.clone(),
+        sid: response
+            .sid
+            .ok_or(InvalidResponseKind::MissingSubscriptionId)?,
+        timeout_seconds: parse_subscription_timeout(response.timeout.as_deref()),
+    })
+}
+
+/// Renew an event subscription before it expires.
+/// Returns the number of seconds until the renewed subscription expires.
+pub(crate) async fn renew_subscription(
+    subscription: &EventSubscription,
+    timeout: Duration,
+) -> Result<u32, Failure> {
+    let request = format!(
+        "SUBSCRIBE {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         SID: {sid}\r\n\
+         TIMEOUT: Second-{EVENT_TIMEOUT_SECONDS}\r\n\
+         Connection: close\r\n\r\n",
+        path = subscription.url.path,
+        host = host_header(&subscription.url.address),
+        sid = subscription.sid,
+    );
+    let response = http_request(subscription.url.address, request.as_bytes(), timeout).await?;
+    if response.status != 200 {
+        return Err(Failure::HttpStatus(response.status));
+    }
+
+    Ok(parse_subscription_timeout(response.timeout.as_deref()))
+}
+
+/// Cancel an event subscription, which would otherwise remain active until its timeout expires.
+pub(crate) async fn unsubscribe(
+    subscription: &EventSubscription,
+    timeout: Duration,
+) -> Result<(), Failure> {
+    let request = format!(
+        "UNSUBSCRIBE {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         SID: {sid}\r\n\
+         Connection: close\r\n\r\n",
+        path = subscription.url.path,
+        host = host_header(&subscription.url.address),
+        sid = subscription.sid,
+    );
+    let response = http_request(subscription.url.address, request.as_bytes(), timeout).await?;
+    if response.status != 200 {
+        return Err(Failure::HttpStatus(response.status));
+    }
+
+    Ok(())
+}
+
+/// Parse the number of seconds in a subscription timeout header, e.g. `Second-1800`.
+/// Falls back to the requested duration when the header is missing or unparsable.
+fn parse_subscription_timeout(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| {
+            value
+                .get(.."Second-".len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case("Second-"))
+                .and_then(|_| value["Second-".len()..].parse().ok())
+        })
+        .unwrap_or(EVENT_TIMEOUT_SECONDS)
+}
+
+/// An event notification request received on the callback listener.
+struct EventNotification {
+    /// The request method, expected to be `NOTIFY`.
+    method: String,
+
+    /// The subscription identifier the event belongs to.
+    sid: Option<String>,
+
+    /// The event sequence number: `0` for the initial event, counting upward for later
+    /// events and wrapping back to `1`. A gap means events were lost.
+    seq: Option<u32>,
+
+    /// The property set carried by the event.
+    body: String,
+}
+
+/// Try to parse an event notification request, returning `Ok(None)` if it is incomplete.
+/// `eof` indicates that no more data will arrive, making an incomplete request an error.
+fn parse_notify_request(
+    raw: &[u8],
+    eof: bool,
+) -> Result<Option<EventNotification>, InvalidResponseKind> {
+    // Wait for the header separator before parsing, accepting bare line feeds as in responses.
+    let crlf_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| (i, 4));
+    let lf_end = raw.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
+    let Some((head_end, separator_len)) = crlf_end
+        .into_iter()
+        .chain(lf_end)
+        .min_by_key(|(position, _)| *position)
+    else {
+        return if eof {
+            Err(InvalidResponseKind::HttpResponse)
+        } else {
+            Ok(None)
+        };
+    };
+    let head =
+        std::str::from_utf8(&raw[..head_end]).map_err(|_| InvalidResponseKind::HttpResponse)?;
+    let body = &raw[head_end + separator_len..];
+
+    // Parse the method from the request line, e.g. `NOTIFY / HTTP/1.1`.
+    let mut lines = head.lines();
+    let method = lines
+        .next()
+        .and_then(|line| line.split_ascii_whitespace().next())
+        .ok_or(InvalidResponseKind::HttpResponse)?
+        .to_string();
+
+    // Read the headers relevant to event delivery. Header names are case-insensitive.
+    let mut content_length = None;
+    let mut chunked = false;
+    let mut sid = None;
+    let mut seq = None;
+    for (name, value) in lines.filter_map(|line| line.split_once(':')) {
+        let (name, value) = (name.trim(), value.trim());
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| InvalidResponseKind::HttpResponse)?,
+            );
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value.eq_ignore_ascii_case("chunked");
+        } else if name.eq_ignore_ascii_case("sid") {
+            sid = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("seq") {
+            seq = value.parse().ok();
+        }
+    }
+
+    // Wait for the full property set, accepting a shorter body once the connection has closed.
+    // Unlike responses, a request without explicit framing has an empty body.
+    let body = if chunked {
+        match decode_chunked(body)? {
+            Some(body) => body,
+            None if eof => return Err(InvalidResponseKind::HttpResponse),
+            None => return Ok(None),
+        }
+    } else {
+        match body.get(..content_length.unwrap_or(0)) {
+            Some(body) => body.to_vec(),
+            None if eof => body.to_vec(),
+            None => return Ok(None),
+        }
+    };
+
+    Ok(Some(EventNotification {
+        method,
+        sid,
+        seq,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }))
+}
+
+/// An event notification read from the callback listener.
+pub(crate) enum Notification {
+    /// The connection did not carry an event for our subscription.
+    NotOurs,
+
+    /// An event for our subscription, with the values it carried.
+    Event {
+        /// The external IP address of the gateway, if the event carried one.
+        external_ip: Option<IpAddr>,
+
+        /// The event sequence number, if the event carried one.
+        seq: Option<u32>,
+    },
+}
+
+/// Read an event notification from an accepted callback connection and acknowledge it.
+pub(crate) async fn read_notification(
+    mut stream: tokio::net::TcpStream,
+    expected_sid: &str,
+    timeout: Duration,
+) -> Result<Notification, Failure> {
+    let exchange = async {
+        // Read until the notification request is complete, mirroring `http_request`.
+        let mut request = Vec::new();
+        let mut chunk = [0; 4096];
+        let notification = loop {
+            let n = stream.read(&mut chunk).await.map_err(Failure::Socket)?;
+            let eof = n == 0;
+            request.extend_from_slice(&chunk[..n]);
+
+            if request.len() > MAX_HTTP_RESPONSE_SIZE {
+                return Err(InvalidResponseKind::ResponseTooLarge.into());
+            }
+            if let Some(notification) = parse_notify_request(&request, eof)? {
+                break notification;
+            }
+        };
+
+        // Acknowledge events for our subscription; reject others as the architecture specifies.
+        let ours = notification.method.eq_ignore_ascii_case("NOTIFY")
+            && notification.sid.as_deref() == Some(expected_sid);
+        let status = if ours {
+            "200 OK"
+        } else {
+            "412 Precondition Failed"
+        };
+        let response =
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        if !ours {
+            return Ok(Notification::NotOurs);
+        }
+
+        // The initial event carries all evented variables, later events only the changed ones.
+        // Gateways without an established WAN connection may report an empty address.
+        let external_ip =
+            find_tag_value(&notification.body, "ExternalIPAddress").and_then(|value| {
+                if value.is_empty() {
+                    Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                } else {
+                    value.parse().ok()
+                }
+            });
+        Ok(Notification::Event {
+            external_ip,
+            seq: notification.seq,
+        })
+    };
+
+    // Limit the total time of the exchange, since TCP will otherwise retransmit indefinitely.
+    tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| Failure::Timeout)?
 }
 
 #[cfg(test)]

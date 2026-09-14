@@ -69,3 +69,22 @@ fn test_code_to_result_all_errors() {
         Failure::UnsupportedOpcode
     ));
 }
+
+/// External address change announcements share the format of an `ExternalAddress` response.
+#[test]
+fn test_parse_address_announcement() {
+    let mut announcement = [0u8; 12];
+    announcement[1] = 0x80; // `ExternalAddress` response opcode.
+    announcement[4..8].copy_from_slice(&2000u32.to_be_bytes()); // Gateway epoch.
+    announcement[8..12].copy_from_slice(&[80, 100, 100, 1]); // External address.
+    assert_eq!(
+        parse_address_announcement(&announcement),
+        Some((Ipv4Addr::new(80, 100, 100, 1), 2000))
+    );
+
+    // Failed responses and other messages are not announcements.
+    let mut failed = announcement;
+    failed[3] = ResultCode::NetworkFailure as u8;
+    assert_eq!(parse_address_announcement(&failed), None);
+    assert_eq!(parse_address_announcement(&announcement[..8]), None);
+}

@@ -159,6 +159,7 @@ fn test_parse_device_description_prefers_latest_service() {
          <service>\
          <serviceType>urn:schemas-upnp-org:service:WANIPConnection:2</serviceType>\
          <controlURL>/ctl/IPConn2</controlURL>\
+         <eventSubURL>/evt/IPConn2</eventSubURL>\
          </service>\
          <service>\
          <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>\
@@ -169,9 +170,21 @@ fn test_parse_device_description_prefers_latest_service() {
     assert_eq!(
         services,
         vec![
-            (WanService::WanIpConnection2, "/ctl/IPConn2".to_string()),
-            (WanService::WanIpConnection1, "/ctl/IPConn1".to_string()),
-            (WanService::WanPppConnection1, "/ctl/PPP".to_string()),
+            DescriptionService {
+                service: WanService::WanIpConnection2,
+                control_url: "/ctl/IPConn2".to_string(),
+                event_url: Some("/evt/IPConn2".to_string()),
+            },
+            DescriptionService {
+                service: WanService::WanIpConnection1,
+                control_url: "/ctl/IPConn1".to_string(),
+                event_url: None,
+            },
+            DescriptionService {
+                service: WanService::WanPppConnection1,
+                control_url: "/ctl/PPP".to_string(),
+                event_url: None,
+            },
         ]
     );
     assert_eq!(url_base, None);
@@ -192,7 +205,11 @@ fn test_parse_device_description_skips_missing_control_url() {
     let (services, _) = parse_device_description(&description).unwrap();
     assert_eq!(
         services,
-        vec![(WanService::WanIpConnection1, "/ctl/IPConn1".to_string())]
+        vec![DescriptionService {
+            service: WanService::WanIpConnection1,
+            control_url: "/ctl/IPConn1".to_string(),
+            event_url: None,
+        }]
     );
 }
 
@@ -211,6 +228,20 @@ fn test_parse_device_description_no_service() {
     ));
 }
 
+/// An empty event subscription URL is treated as the service not offering eventing.
+#[test]
+fn test_parse_device_description_empty_event_url() {
+    let description = make_description(
+        "<service>\
+         <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>\
+         <controlURL>/ctl/IPConn1</controlURL>\
+         <eventSubURL></eventSubURL>\
+         </service>",
+    );
+    let (services, _) = parse_device_description(&description).unwrap();
+    assert_eq!(services[0].event_url, None);
+}
+
 /// The legacy `URLBase` element should be extracted, and XML entities in URLs decoded.
 #[test]
 fn test_parse_device_description_url_base_and_entities() {
@@ -225,7 +256,80 @@ fn test_parse_device_description_url_base_and_entities() {
     );
     let (services, url_base) = parse_device_description(&description).unwrap();
     assert_eq!(url_base.as_deref(), Some("http://192.168.1.1:5000"));
-    assert_eq!(services[0].1, "/ctl?a=1&b=2");
+    assert_eq!(services[0].control_url, "/ctl?a=1&b=2");
+}
+
+/// Subscription timeout headers decompose to their seconds, with a fallback for odd values.
+#[test]
+fn test_parse_subscription_timeout() {
+    assert_eq!(parse_subscription_timeout(Some("Second-300")), 300);
+    assert_eq!(parse_subscription_timeout(Some("second-1800")), 1800);
+
+    // Missing or unparsable values fall back to the requested duration.
+    assert_eq!(parse_subscription_timeout(None), EVENT_TIMEOUT_SECONDS);
+    assert_eq!(
+        parse_subscription_timeout(Some("infinite")),
+        EVENT_TIMEOUT_SECONDS
+    );
+}
+
+/// Event notifications should decompose into their method, subscription, and property set.
+#[test]
+fn test_parse_notify_request() {
+    let request = b"NOTIFY / HTTP/1.1\r\n\
+                    Host: 192.168.1.2:5000\r\n\
+                    Content-Type: text/xml\r\n\
+                    NT: upnp:event\r\n\
+                    SID: uuid:1234\r\n\
+                    SEQ: 0\r\n\
+                    Content-Length: 76\r\n\r\n\
+                    <e:property><ExternalIPAddress>80.100.100.1</ExternalIPAddress></e:property>";
+
+    // The request is incomplete until the full property set has been read.
+    assert!(parse_notify_request(&request[..request.len() - 5], false)
+        .unwrap()
+        .is_none());
+
+    let notification = parse_notify_request(request, false).unwrap().unwrap();
+    assert_eq!(notification.method, "NOTIFY");
+    assert_eq!(notification.sid.as_deref(), Some("uuid:1234"));
+    assert_eq!(notification.seq, Some(0));
+    assert_eq!(
+        find_tag_value(&notification.body, "ExternalIPAddress"),
+        Some("80.100.100.1")
+    );
+}
+
+/// A notification body cut short by the connection closing is accepted leniently.
+#[test]
+fn test_parse_notify_request_short_body() {
+    let request =
+        b"NOTIFY / HTTP/1.1\r\nSID: uuid:1\r\nContent-Length: 500\r\n\r\n<e:property></e:property>";
+    assert!(parse_notify_request(request, false).unwrap().is_none());
+
+    let notification = parse_notify_request(request, true).unwrap().unwrap();
+    assert_eq!(notification.body, "<e:property></e:property>");
+}
+
+/// Notifications may frame their property set with chunked encoding.
+#[test]
+fn test_parse_notify_request_chunked() {
+    let request = b"NOTIFY / HTTP/1.1\r\nSID: uuid:1\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    e\r\n<a>1.2.3.4</a>\r\n0\r\n\r\n";
+    let notification = parse_notify_request(request, false).unwrap().unwrap();
+    assert_eq!(notification.body, "<a>1.2.3.4</a>");
+}
+
+/// Subscription responses should expose their SID and timeout headers.
+#[test]
+fn test_parse_http_response_subscription_headers() {
+    let response = b"HTTP/1.1 200 OK\r\n\
+                     SID: uuid:0000-1111\r\n\
+                     TIMEOUT: Second-1800\r\n\
+                     Content-Length: 0\r\n\r\n";
+    let response = parse_http_response(response, false).unwrap().unwrap();
+    assert_eq!(response.sid.as_deref(), Some("uuid:0000-1111"));
+    assert_eq!(response.timeout.as_deref(), Some("Second-1800"));
 }
 
 /// Control URLs resolve against the description location, the `URLBase`, or stand alone.

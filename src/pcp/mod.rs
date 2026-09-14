@@ -92,6 +92,10 @@ pub enum ResultCode {
 #[derive(Clone, Copy, Debug, num_enum::TryFromPrimitive, PartialEq)]
 #[repr(u8)]
 pub enum OperationCode {
+    /// Announce server state changes, e.g. after a reboot.
+    /// Sent unsolicited to the multicast announcement group, see <https://www.rfc-editor.org/rfc/rfc6887#section-14.1>.
+    Announce,
+
     /// Create a port mapping on the gateway.
     Map = 1,
 
@@ -333,13 +337,13 @@ pub async fn port_mapping(
         protocol: base.protocol,
         internal_port: base.internal_port,
         external_port,
+        external_ip,
         lifetime_seconds,
         expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
         gateway_epoch_seconds,
         mapping_type: PortMappingType::Pcp {
             client: base.client,
             nonce,
-            external_ip,
         },
         timeout_config,
     })
@@ -1062,6 +1066,51 @@ fn validate_base_response(
         lifetime_seconds,
         gateway_epoch_seconds,
     })
+}
+
+/// Parse an unsolicited `Announce` response multicast by the server after state changes,
+/// see <https://www.rfc-editor.org/rfc/rfc6887#section-14.1.3>.
+/// Returns the server epoch, or `None` for other datagrams.
+pub(crate) fn parse_announce(datagram: &[u8]) -> Option<u32> {
+    // Announce responses share the common response header layout.
+    if datagram.len() < HEADER_SIZE
+        || datagram[0] != VersionCode::Pcp as u8
+        || datagram[1] != (0x80 | OperationCode::Announce as u8)
+        || datagram[3] != ResultCode::Success as u8
+    {
+        return None;
+    }
+
+    Some(u32::from_be_bytes([
+        datagram[8],
+        datagram[9],
+        datagram[10],
+        datagram[11],
+    ]))
+}
+
+/// Whether a newly observed gateway epoch is consistent with the time elapsed since a previous
+/// observation, using the validation from <https://www.rfc-editor.org/rfc/rfc6887#section-8.5>.
+/// An inconsistent epoch means the gateway likely rebooted and lost its state, in which case
+/// existing mappings should be recreated. NAT-PMP prescribes the same check, see
+/// <https://www.rfc-editor.org/rfc/rfc6886#section-3.6>.
+#[must_use]
+pub fn epoch_is_consistent(
+    elapsed_seconds: u64,
+    previous_epoch_seconds: u32,
+    epoch_seconds: u32,
+) -> bool {
+    // The epoch going backwards by more than one second indicates a reset. A regression of a
+    // single second is tolerated so that reordered announcements are not misread as one.
+    if epoch_seconds.saturating_add(1) < previous_epoch_seconds {
+        return false;
+    }
+
+    // Allow the clocks to drift apart by a sixteenth, plus a fixed tolerance, in either direction.
+    let client_delta = elapsed_seconds;
+    let server_delta = u64::from(epoch_seconds.saturating_sub(previous_epoch_seconds));
+    server_delta + 2 >= client_delta - client_delta / 16
+        && client_delta + 2 >= server_delta - server_delta / 16
 }
 
 /// Response `OperationCode` bits are the same as the request
